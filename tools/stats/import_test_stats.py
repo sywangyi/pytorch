@@ -83,7 +83,7 @@ def get_slow_tests(
 
 def get_test_times(dirpath: str, filename: str) -> Dict[str, Dict[str, float]]:
     url = "https://raw.githubusercontent.com/pytorch/test-infra/generated-stats/stats/test-times.json"
-    build_environment = os.environ.get("BUILD_ENVIRONMENT")
+    build_environment = os.environ.get("JOB_NAME").split(" ")[0]
     if build_environment is None:
         test_times = fetch_and_cache(dirpath, filename, url, lambda x: x)
         raise RuntimeError(
