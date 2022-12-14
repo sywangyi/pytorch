@@ -9,8 +9,6 @@ from inspect import currentframe, getframeinfo
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 from weakref import ReferenceType
 
-import numpy as np
-
 import sympy
 
 import torch
@@ -187,16 +185,9 @@ class GuardBuilder(GuardBuilderBase):
                 torch.Size,
                 torch.device,
                 torch.dtype,
-                np.int8,
-                np.int16,
-                np.int32,
-                np.int64,
-                np.uint8,
-                np.uint16,
-                np.uint32,
-                np.uint64,
             ),
         ), t.__name__
+
         if istype(val, (torch.device, torch.dtype)):
             # TODO(jansel): is this slow? perhaps optimize it
             code = [f"str({ref}) == {str(val)!r}"]
