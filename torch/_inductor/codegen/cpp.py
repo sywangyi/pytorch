@@ -336,7 +336,8 @@ class CppVecOverrides(OpOverrides):
 
     @staticmethod
     def where(a, b, c):
-        return f"decltype({b})::blendv({c}, {b}, {a})"
+        # return a ? b : c
+        return f"decltype({b})::blendv({c}, {b}, ({a}) != decltype({a})(0))"
 
     @staticmethod
     def sign(x):
@@ -359,7 +360,10 @@ class CppVecOverrides(OpOverrides):
 
     @staticmethod
     def to_dtype(x, dtype):
-        assert dtype in [torch.bool], f"{__name__} does not support {dtype}"
+        assert dtype in [
+            torch.bool,
+            torch.float,
+        ], f"{__name__} does not support {dtype}"
         return f"({x})"
 
 
@@ -785,22 +789,34 @@ class CppVecKernel(CppKernel):
         expanded_index = sympy.expand(index)
         new_index = self.transform_index(index)
 
-        if expanded_index == new_index:
-            line = f"at::vec::Vectorized<float>({var}[{cexpr(index)}])"
-        else:
-            if V.graph.get_dtype(name) in [torch.bool, torch.uint8]:
-                nelements = codecache.pick_vec_isa().nelements()
+        def load_help(load_index, nelements):
+            if V.graph.get_dtype(name) != torch.float:
                 if var not in self.var_vec_buf_map:
                     self.var_vec_buf_map[var] = f"g_tmp_buffer_{var}"
                     self.loads.writeline(
                         f"float {self.var_vec_buf_map[var]}[{nelements}] = {{0}};"
                     )
+
                 self.loads.writeline(
-                    f"flag_to_float({var} + {cexpr(new_index)}, {self.var_vec_buf_map[var]}, {nelements});"
+                    f"to_float({var} + {cexpr(load_index)}, {self.var_vec_buf_map[var]}, {nelements});"
                 )
-                line = f"at::vec::Vectorized<float>::loadu({self.var_vec_buf_map[var]})"
+                if nelements == 1:
+                    line = f"at::vec::Vectorized<float>({self.var_vec_buf_map[var]}[{cexpr(load_index)}])"
+                else:
+                    line = f"at::vec::Vectorized<float>::loadu({self.var_vec_buf_map[var]})"
             else:
-                line = f"at::vec::Vectorized<float>::loadu({var} + {cexpr(new_index)})"
+                if nelements == 1:
+                    line = f"at::vec::Vectorized<float>({var}[{cexpr(load_index)}])"
+                else:
+                    line = f"at::vec::Vectorized<float>::loadu({var} + {cexpr(load_index)})"
+            return line
+
+        if expanded_index == new_index:
+            nelements = 1
+            line = load_help(index, nelements)
+        else:
+            nelements = codecache.pick_vec_isa().nelements()
+            line = load_help(new_index, nelements)
 
         return self.cse.generate(self.loads, line)
 
@@ -911,6 +927,7 @@ class CppVecKernelChecker(CppVecKernel):
             torch.float32,
             torch.bool,
             torch.uint8,
+            torch.float64,
         ]:
             self.simd_vec = False
             return self.simd_vec
@@ -1011,7 +1028,7 @@ class CppVecKernelChecker(CppVecKernel):
 
             @staticmethod
             def to_dtype(x, dtype):
-                if dtype != torch.bool:
+                if dtype not in [torch.bool, torch.float]:
                     self.simd_vec = False
                 return x
 
