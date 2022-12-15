@@ -6,9 +6,11 @@ from torch.fx import symbolic_trace
 from torch.nn.utils import parametrize
 from typing import Type, Set, Dict, Callable, Tuple, Optional, Union
 
+import operator
+
 from torch.ao.pruning import BaseSparsifier
-from .parametrization import FakeStructuredSparsity, BiasHook
-from .match_utils import apply_match
+from .parametrization import FakeStructuredSparsity, BiasHook, module_contains_param
+from .match_utils import apply_match, MatchAllNode
 from .prune_functions import (
     prune_linear,
     prune_linear_linear,
@@ -19,6 +21,7 @@ from .prune_functions import (
     prune_conv2d_activation_pool_conv2d,
     prune_conv2d_pool_activation_conv2d,
     prune_conv2d_pool_flatten_linear,
+    prune_lstm_linear,
 )
 
 
@@ -26,6 +29,7 @@ def _get_supported_structured_pruning_modules():
     SUPPORTED_STRUCTURED_PRUNING_MODULES = {  # added to config if None given
         nn.Linear,
         nn.Conv2d,
+        nn.LSTM
     }
     return SUPPORTED_STRUCTURED_PRUNING_MODULES
 
@@ -83,14 +87,14 @@ def _get_supported_activation_modules():
 
 
 def _get_default_structured_pruning_patterns() -> Dict[
-    Tuple[Union[Type[nn.Module], Callable[[torch.Tensor], torch.Tensor], str], ...],
+    Tuple[Union[Type[nn.Module], Callable, MatchAllNode, str], ...],
     Callable[..., None],
 ]:
     """
     Returns the patterns for conv2d / linear conversion for each element in the activation functions/modules defined above.
     """
     patterns: Dict[
-        Tuple[Union[Type[nn.Module], Callable[[torch.Tensor], torch.Tensor], str], ...],
+        Tuple[Union[Type[nn.Module], Callable, MatchAllNode, str], ...],
         Callable[..., None],
     ] = {
         # linear -> linear
@@ -99,6 +103,8 @@ def _get_default_structured_pruning_patterns() -> Dict[
         # conv2d -> conv2d
         (nn.Conv2d, "output"): prune_conv2d,
         (nn.Conv2d, nn.Conv2d): prune_conv2d_conv2d,
+        # lstm -> getitem -> linear
+        (nn.LSTM, MatchAllNode, nn.Linear): prune_lstm_linear,
     }
 
     for activation in chain(
@@ -222,8 +228,6 @@ class BaseStructuredSparsifier(BaseSparsifier):
         r"""This function will attach the FakeStructuredSparsity parameterizations
         and BiasHooks at the appropriate points in the model.
         """
-        self.bias_handles = []
-
         for config in self.groups:
             module = config["module"]
             tensor_name = config["tensor_name"]
@@ -238,17 +242,20 @@ class BaseStructuredSparsifier(BaseSparsifier):
             parametrize.register_parametrization(
                 module, tensor_name, parametrization(mask)
             )
-            prune_bias = config.get("prune_bias", True)
-            if module.bias is not None:
-                module.register_parameter("_bias", nn.Parameter(module.bias.detach()))
-                module.bias = None
-                module.prune_bias = prune_bias
 
-            self.bias_handles.append(
+            # if linear / conv, we add in bias hooks
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                print(module)
+                prune_bias = config.get("prune_bias", True)
+                if module.bias is not None:
+                    module.register_parameter("_bias", nn.Parameter(module.bias.detach()))
+                    module.bias = None
+                    module.prune_bias = prune_bias
+
                 module.register_forward_hook(
                     BiasHook(module.parametrizations.weight[0], prune_bias)
                 )
-            )
+
 
     def prune(self) -> None:
         r"""
@@ -264,7 +271,6 @@ class BaseStructuredSparsifier(BaseSparsifier):
 
         # Right now we check for matches simply by iterating across all the patterns
         # if this is slow we can store patterns in a trie-structure and modify this code for faster lookup
-
         for node in self.traced.graph.nodes:
             for pattern, convert_fn in self.patterns.items():
                 matched = apply_match(modules, pattern, node, [])
@@ -276,10 +282,7 @@ class BaseStructuredSparsifier(BaseSparsifier):
                 if (
                     first_module is not None
                     and parametrize.is_parametrized(first_module)
-                    and isinstance(
-                        first_module.parametrizations["weight"][0],
-                        FakeStructuredSparsity,
-                    )
+                    and module_contains_param(first_module, FakeStructuredSparsity)
                 ):
                     convert_block = []
                     for node in matched:
@@ -288,6 +291,10 @@ class BaseStructuredSparsifier(BaseSparsifier):
                         elif node.op == "call_function":
                             convert_block.append(node.target)
                     convert_fn(*convert_block)
+
+        for module in self.traced.modules():
+            if module_contains_param(module, FakeStructuredSparsity):
+                raise Exception(f"Error: {module} still contains FakeStructuredSparsity parametrizations!")
 
         self.traced.graph.lint()
         self.traced.recompile()

@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 # Owner(s): ["module: unknown"]
-
-
 import copy
 import logging
 import random
@@ -26,7 +24,9 @@ from torch.testing._internal.common_pruning import (
     Conv2dPool,
     Conv2dPoolFlatten,
     Conv2dPoolFlattenFunctional,
+    LSTMLinearModel,
 )
+
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -49,6 +49,29 @@ class ImplementedPruner(BaseStructuredSparsifier):
         num_rows = len(module.parametrizations[tensor_name][0].mask)
         prune = random.sample(list(range(num_rows)), num_rows // 3)
         module.parametrizations[tensor_name][0].mask[prune] = False
+
+
+
+class BottomHalfPruner(BaseStructuredSparsifier):
+    """
+    Pruner that will remove the bottom half of the rows.
+    This is primarily meant for testing purposes
+    """
+
+    def update_mask(self, module, tensor_name, **kwargs):
+        for p in getattr(module.parametrizations, tensor_name):
+            if isinstance(p, FakeStructuredSparsity):
+                mask = p.mask
+                masks = torch.split(mask, len(mask) // 4)
+
+                for small in masks:
+                    num = len(small)
+                    small[num//2:] = False
+
+                new_mask = torch.cat(masks)
+
+                mask.data = new_mask.data
+                break
 
 
 class TestBaseStructuredSparsifier(TestCase):
@@ -639,3 +662,56 @@ class TestBaseStructuredSparsifier(TestCase):
                     torch.device(device),
                     also_prune_bias,
                 )
+
+    def test_prune_lstm_linear(self):
+        """
+        Test fusion support for LSTM -> Linear layers
+        """
+        model = LSTMLinearModel(
+            ntoken=10,
+            ninp=8,
+            nhid=8,
+            nlayers=3,
+        )
+
+        config = [
+            {"tensor_fqn": "rnn.weight_ih_l0"},
+            {"tensor_fqn": "rnn.weight_hh_l0"},
+            {"tensor_fqn": "rnn.bias_ih_l0"},
+            {"tensor_fqn": "rnn.bias_hh_l0"},
+            {"tensor_fqn": "rnn.weight_ih_l1"},
+            {"tensor_fqn": "rnn.weight_hh_l1"},
+            {"tensor_fqn": "rnn.bias_ih_l1"},
+            {"tensor_fqn": "rnn.bias_hh_l1"},
+            {"tensor_fqn": "rnn.weight_ih_l2"},
+            {"tensor_fqn": "rnn.weight_hh_l2"},
+            {"tensor_fqn": "rnn.bias_ih_l2"},
+            {"tensor_fqn": "rnn.bias_hh_l2"},
+        ]
+
+        rnn_input = torch.ones((1, 8))
+        fx_pruner = BottomHalfPruner({"sparsity_level": 0.5})
+        fx_pruner.prepare(model, config)
+
+        fx_pruner.enable_mask_update = True
+        fx_pruner.step()
+
+        model.eval()
+        # We cannot check that y_expected == y_pruned because
+        # zeros vs. missing elements yield different numerical results.
+        # Instead check that all unpruned elements are the same
+        # and also check that final output is the same shape
+        out_expected, y_expected = model(rnn_input)
+        print([(name, weight.size()) for weight, name in zip(model.rnn._flat_weights, model.rnn._flat_weights_names)])
+
+        pruned_model = fx_pruner.prune()
+        pruned_model.eval()
+        print([(name, weight.size()) for weight, name in zip(pruned_model.rnn._flat_weights, pruned_model.rnn._flat_weights_names)])
+        out_pruned, y_pruned = pruned_model(rnn_input)
+
+        print(y_expected)
+        print(y_pruned)
+
+        r, c = y_expected.size()
+        assert torch.isclose(y_expected[:, :c//2], y_pruned, rtol=1e-05, atol=1e-07).all()
+        assert(out_expected.shape == out_pruned.shape)
