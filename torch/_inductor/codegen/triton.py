@@ -161,6 +161,7 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def relu(x):
+        raise NotImplementedError("Fuck it, I can't do relu")
         return ops.maximum("0", x)
 
     @staticmethod

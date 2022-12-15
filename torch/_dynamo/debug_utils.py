@@ -990,3 +990,60 @@ def dynamo_accuracy_minifier_backend(gm, example_inputs, compiler_name):
     else:
         log.error("Input graph does not fail accuracy testing")
     return gm
+
+
+
+# def raises_exception(fx_g, compiled_fn, *real_inputs):
+#     try:
+#         compiled_fn(*real_inputs)
+#         return False
+#     except:
+#         return True
+    
+
+# def has_bad_accuracy(fx_g, compiled_fn, *real_inputs):
+#     ref = run_fwd_maybe_bwd(fx_g, *real_inputs)
+#     res = run_fwd_maybe_bwd(compiled_fn, *real_inputs)
+#     return not same(ref, res)
+
+
+# def fails_compilation(fx_g, fake_inputs, compiler):
+#     try:
+#         compiler(fx_g, fake_inputs)
+#         return False
+#     except:
+#         return True
+
+    
+
+
+# def minifier_backend(fx_g, fake_inputs, check_if_compilation_fails, check_if_runtime_fails):
+#     if check_if_compilation_fails(fx_g, fake_inputs):
+#         if isolate:
+#             setup_minfier_compiler()
+#         else:
+#             run_minfier_compiler()
+#         raise Exception
+#     else:
+#         compiled_fn = compiler_fn(fx_g, fake_inputs)
+#     def runtime_for_dynamo(*real_inputs):
+#         if check_if_fails_fn(fx_g, compiled_fn, real_inputs):
+#             if isolate:
+#                 setup_minifier_runtime()
+#             else:
+#                 run_minfier_runtime()
+#             raise Exception
+#         else:
+#             return compiled_fn(*real_inputs)
+#     return runtime_for_dynamo
+
+
+
+
+# minifier(
+#     gm,
+#     real_inputs,
+#     module_fails=runtime_minifier,
+#     dump_state=dump_state_fn,
+# )
+
