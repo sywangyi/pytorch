@@ -6,7 +6,7 @@ import itertools
 import math
 import traceback
 import warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import (
@@ -1061,7 +1061,10 @@ class FullyShardedDataParallel(nn.Module):
         device_from_device_id: Optional[torch.device] = self._get_device_from_device_id(device_id)
         self._materialize_module(module, param_init_fn, device_from_device_id)
         self._move_module_to_device(module, ignored_params, device_from_device_id)
-        self.compute_device = self._get_compute_device(module, ignored_params, device_from_device_id)
+        if device_from_device_id != torch.device("cpu"):
+            self.compute_device = self._get_compute_device(module, ignored_params, device_from_device_id)
+        else:
+            self.compute_device = torch.device("cpu")
         params_to_flatten = list(self._get_orig_params(module, ignored_params))
         if sync_module_states:
             self._sync_module_states(module, params_to_flatten)
@@ -1554,16 +1557,23 @@ class FullyShardedDataParallel(nn.Module):
             if event:
                 event.synchronize()
         any_ran_pre_unshard = False
-        with torch.cuda.stream(self._streams["pre_all_gather"]):
+        if self.compute_device != torch.device("cpu"):
+            with torch.cuda.stream(self._streams["pre_all_gather"]):
+                for handle in handles:
+                    ran_pre_unshard = handle.pre_unshard()
+                    any_ran_pre_unshard = any_ran_pre_unshard or ran_pre_unshard
+            if any_ran_pre_unshard:
+                self._streams["all_gather"].wait_stream(self._streams["pre_all_gather"])
+            with torch.cuda.stream(self._streams["all_gather"]):
+                for handle in handles:
+                    handle.unshard()
+                    handle.post_unshard()
+        else:
             for handle in handles:
-                ran_pre_unshard = handle.pre_unshard()
-                any_ran_pre_unshard = any_ran_pre_unshard or ran_pre_unshard
-        if any_ran_pre_unshard:
-            self._streams["all_gather"].wait_stream(self._streams["pre_all_gather"])
-        with torch.cuda.stream(self._streams["all_gather"]):
-            for handle in handles:
+                handle.pre_unshard()
                 handle.unshard()
                 handle.post_unshard()
+
 
     def _reshard(
         self,  # unused
@@ -1821,10 +1831,10 @@ class FullyShardedDataParallel(nn.Module):
         """
         if self._is_root is not None:
             return  # no-op: already initialized
-        if not torch.cuda.is_available():
+   #     if not torch.cuda.is_available():
             # Allow the FSDP constructor to run even with CUDA but check this
             # once we start real execution
-            raise RuntimeError("FSDP does not support CPU only execution")
+    #        raise RuntimeError("FSDP does not support CPU only execution")
         # The following logic is only run on the root FSDP instance since it
         # will set `_is_root=False` for the non-root instances
         self._is_root = True
@@ -1976,13 +1986,22 @@ class FullyShardedDataParallel(nn.Module):
         """Initializes CUDA streams for overlapping data transfer and
         computation. This should only be called on the root FSDP instance."""
         assert self._is_root
-        assert torch.cuda.is_available()
-        # Stream for all-gathering parameters.
-        self._streams["all_gather"] = torch.cuda.Stream()
-        # Stream for overlapping grad reduction with the backward pass.
-        self._streams["post_backward"] = torch.cuda.Stream()
-        # Stream for pre-all-gather copies (e.g. H2D or precision cast).
-        self._streams["pre_all_gather"] = torch.cuda.Stream()
+        if self.compute_device != torch.device("cpu"):
+            assert torch.cuda.is_available()
+            # Stream for all-gathering parameters.
+            self._streams["all_gather"] = torch.cuda.Stream()
+            # Stream for overlapping grad reduction with the backward pass.
+            self._streams["post_backward"] = torch.cuda.Stream()
+            # Stream for pre-all-gather copies (e.g. H2D or precision cast).
+            self._streams["pre_all_gather"] = torch.cuda.Stream()
+        else:
+            # Stream for all-gathering parameters.
+            self._streams["all_gather"] = None
+            # Stream for overlapping grad reduction with the backward pass.
+            self._streams["post_backward"] = None
+            # Stream for pre-all-gather copies (e.g. H2D or precision cast).
+            self._streams["pre_all_gather"] = None
+
 
     def _wait_for_previous_optim_step(self) -> None:
         """
@@ -2768,7 +2787,8 @@ class FullyShardedDataParallel(nn.Module):
             self._unshard(handles)
             handles_key = tuple(handles)
             self._needs_pre_forward_unshard[handles_key] = False
-            torch.cuda.current_stream().wait_stream(self._streams["all_gather"])
+            if self.compute_device != torch.device("cpu"):
+                torch.cuda.current_stream().wait_stream(self._streams["all_gather"])
             self._prefetch_handles(handles_key)
 
     def _post_forward(
@@ -2843,7 +2863,8 @@ class FullyShardedDataParallel(nn.Module):
                 handles_key = tuple(fsdp_module._handles)
                 if handles_key:
                     self._needs_pre_forward_unshard[handles_key] = True
-        self._wait_for_previous_optim_step()
+        if self.compute_device != torch.device("cpu"):
+            self._wait_for_previous_optim_step()
         args, kwargs = self._cast_forward_inputs(*args, **kwargs)
         return args, kwargs
 
@@ -3131,7 +3152,8 @@ class FullyShardedDataParallel(nn.Module):
                 # If the handles have been prefetched, this `_unshard()` simply
                 # switches to using the unsharded parameter
                 self._unshard(_handles)
-                torch.cuda.current_stream().wait_stream(self._streams["all_gather"])
+                if self.compute_device != torch.device("cpu"):
+                    torch.cuda.current_stream().wait_stream(self._streams["all_gather"])
 
                 # Set this to `False` to ensure that a mistargeted prefetch
                 # does not actually unshard these handles
@@ -3245,9 +3267,10 @@ class FullyShardedDataParallel(nn.Module):
 
             # Wait for all ops in the current stream (e.g. gradient
             # computation) to finish before reduce-scattering the gradient
-            self._streams["post_backward"].wait_stream(torch.cuda.current_stream())
+            if self.compute_device != torch.device("cpu"):
+                self._streams["post_backward"].wait_stream(torch.cuda.current_stream())
 
-            with torch.cuda.stream(self._streams["post_backward"]):
+            with torch.cuda.stream(self._streams["post_backward"]) if self.compute_device != torch.device("cpu") else nullcontext():
                 orig_grad_data = param.grad.data
                 if (
                     self._mixed_precision_enabled_for_reduce()
@@ -3352,7 +3375,8 @@ class FullyShardedDataParallel(nn.Module):
                 # further reuse by the main stream while the div/reduce_scatter/copy
                 # are underway in the post_backward stream. See:
                 # github.com/NVIDIA/apex/blob/master/apex/parallel/distributed.py
-                orig_grad_data.record_stream(self._streams["post_backward"])
+                if self._streams["post_backward"] != None:
+                    orig_grad_data.record_stream(self._streams["post_backward"])
 
     def _cast_grad_to_param_dtype(
         self,
@@ -3414,7 +3438,8 @@ class FullyShardedDataParallel(nn.Module):
         # module.
 
         if self._sync_gradients:
-            torch.cuda.current_stream().wait_stream(self._streams["post_backward"])
+            if self.compute_device != torch.device("cpu"):
+                torch.cuda.current_stream().wait_stream(self._streams["post_backward"])
             if self.cpu_offload.offload_params:
                 # We need to wait for the non-blocking GPU ->
                 # CPU grad transfers to finish. We need to do this for GPU -> CPU
