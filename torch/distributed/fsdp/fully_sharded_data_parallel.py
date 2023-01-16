@@ -1414,7 +1414,8 @@ class FullyShardedDataParallel(nn.Module):
         if device_from_device_id is not None:
             if param.device == cpu_device:
                 # NOTE: This includes moving ignored modules' parameters.
-                module = module.to(device_from_device_id)
+                if device_from_device_id != torch.device("cpu"):
+                    module = module.to(device_from_device_id)
                 # TODO: This is a temporary fix to move already- constructed
                 # `FlatParameter`s back to CPU if needed. This is needed to
                 # make CPU offload work with `device_id`.
@@ -2011,12 +2012,13 @@ class FullyShardedDataParallel(nn.Module):
         """
         if not self._is_root:
             return
-        current_stream = torch.cuda.current_stream()
-        self._streams["all_gather"].wait_stream(current_stream)
-        # Having the pre-all-gather stream wait for the current stream even if
-        # we do not leverage the pre-all-gather stream is tolerable since this
-        # only runs once per iteration
-        self._streams["pre_all_gather"].wait_stream(current_stream)
+        if self.compute_device != torch.device("cpu"):
+            current_stream = torch.cuda.current_stream()
+            self._streams["all_gather"].wait_stream(current_stream)
+            # Having the pre-all-gather stream wait for the current stream even if
+            # we do not leverage the pre-all-gather stream is tolerable since this
+            # only runs once per iteration
+            self._streams["pre_all_gather"].wait_stream(current_stream)
 
     def _prefetch_handles(
         self,
@@ -3001,7 +3003,8 @@ class FullyShardedDataParallel(nn.Module):
 
         free_unsharded_flat_params = [handle.needs_unshard() for handle in self._handles]
         self._unshard(self._handles)
-        torch.cuda.current_stream().wait_stream(self._streams["all_gather"])
+        if self.compute_device != torch.device("cpu"):
+            torch.cuda.current_stream().wait_stream(self._streams["all_gather"])
 
         if rank0_only and self.rank != 0:
             # Free the unsharded flattened parameter early
@@ -3685,7 +3688,10 @@ class FullyShardedDataParallel(nn.Module):
         max_norm = float(max_norm)
         norm_type = float(norm_type)
         # Computes the max norm for this shard's gradients and sync's across workers
-        local_norm = _calc_grad_norm(self.params_with_grad, norm_type).cuda()  # type: ignore[arg-type]
+        if self.compute_device != torch.device("cpu"):
+            local_norm = _calc_grad_norm(self.params_with_grad, norm_type).cuda()  # type: ignore[arg-type]
+        else:
+            local_norm = _calc_grad_norm(self.params_with_grad, norm_type).cpu()  # type: ignore[arg-type]
         if norm_type == math.inf:
             total_norm = local_norm
             dist.all_reduce(total_norm, op=torch.distributed.ReduceOp.MAX, group=self.process_group)
