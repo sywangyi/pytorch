@@ -2992,7 +2992,8 @@ class FullyShardedDataParallel(nn.Module):
                 yield
             return
 
-        torch.cuda.synchronize()
+        if self.compute_device != torch.device("cpu"):
+            torch.cuda.synchronize()
         self._lazy_init()
         self._assert_state([TrainingState_.IDLE])
         for handle in self._handles:
